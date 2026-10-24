@@ -1,0 +1,16 @@
+{
+  "name": "footvalue",
+  "version": "5.0.0",
+  "private": true,
+  "description": "Estimation probabiliste de scores football (Dixon-Coles) et comparaison de cotes. Outil éducatif, sans placement de paris.",
+  "type": "module",
+  "scripts": {
+    "dev": "netlify dev"
+  },
+  "devDependencies": {
+    "netlify-cli": "^17.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
