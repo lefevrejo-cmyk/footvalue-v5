@@ -1,6 +1,7 @@
 /* ============================================================
-   FootValue V5 — moteur de calcul
+   FootValue V5.1 — moteur de calcul
    Dixon-Coles + pondération exponentielle + shrinkage bayésien.
+   Comparateur 1X2 avec marge réellement retirée.
    ============================================================ */
 
 const $ = id => document.getElementById(id);
@@ -8,33 +9,28 @@ const $ = id => document.getElementById(id);
 /* ---------- État global ---------- */
 const state = {
   selected: null,      // { id, home, away, date }
-  model: null,         // { lh, la, rho, homeStats, awayStats, fallback }
+  model: null,         // { lh, la, rho, home, away, fallback }
   picks: [],
   history: [],
-  lastError: null      // conservé pour ne plus être écrasé par le rendu
+  lastError: null
 };
 
 /* ---------- Paramètres du modèle (ajustables) ---------- */
 
 // Décroissance exponentielle de la pondération par récence.
-// xi = 0.0025 -> demi-vie ~ 277 jours (~9 mois).
+// xi = 0,0025 -> demi-vie ~ 277 jours (~9 mois).
 const XI = 0.0025;
 
 // Force du shrinkage bayésien : n / (n + K).
-// K = 12 -> à 12 matchs observés, le modèle fait moitié confiance
-// aux données et moitié à la moyenne de la compétition.
 const SHRINK_K = 12;
 
-// Correction Dixon-Coles : plus rho est négatif, plus on ajoute de nuls.
-// -0.08 est une valeur raisonnable pour les grands championnats européens,
-// en attendant une estimation par maximum de vraisemblance sur l'historique.
+// Correction Dixon-Coles. Négatif = plus de nuls que Poisson pur.
 const RHO_DEFAULT = -0.08;
 
-// Moyennes de la compétition (buts par équipe et par match).
-// Sert de point d'ancrage pour le shrinkage.
+// Moyennes de buts de la compétition (ancrage du shrinkage).
 const LEAGUE_AVG = { home: 1.50, away: 1.22, total: 2.72 };
 
-// Nombre de matchs récupérés par équipe (10 = plus de matière que la V3).
+// Matchs retenus par équipe.
 const FORM_DEPTH = 10;
 
 /* ---------- Utilitaires ---------- */
@@ -70,16 +66,13 @@ async function api(path) {
    1. MATHÉMATIQUES
    ============================================================ */
 
-// Densité de Poisson P(X = k) pour une moyenne l.
 function poissonPmf(k, l) {
   let p = Math.exp(-l);
   for (let i = 1; i <= k; i++) p *= l / i;
   return p;
 }
 
-// Correction Dixon-Coles sur les scores faibles.
-// Sans elle, Poisson sous-estime systématiquement les 0-0, 1-0, 0-1 et 1-1,
-// donc les matchs nuls.
+// Correction Dixon-Coles sur les scores faibles (0-0, 0-1, 1-0, 1-1).
 function dcTau(x, y, lh, la, rho) {
   if (x === 0 && y === 0) return 1 - lh * la * rho;
   if (x === 0 && y === 1) return 1 + lh * rho;
@@ -96,7 +89,7 @@ function calcProbs(lh, la, rho = RHO_DEFAULT) {
   for (let h = 0; h <= MAX; h++) {
     for (let a = 0; a <= MAX; a++) {
       let p = dcTau(h, a, lh, la, rho) * poissonPmf(h, lh) * poissonPmf(a, la);
-      if (p < 0) p = 0;               // garde-fou : tau peut passer négatif
+      if (p < 0) p = 0;
       total += p;
       if (h > a) home += p;
       else if (h === a) draw += p;
@@ -106,7 +99,6 @@ function calcProbs(lh, la, rho = RHO_DEFAULT) {
     }
   }
 
-  // Renormalisation : indispensable, tau casse la somme à 1.
   if (total > 0) { home /= total; draw /= total; away /= total; over /= total; btts /= total; }
 
   return {
@@ -124,7 +116,6 @@ function calcProbs(lh, la, rho = RHO_DEFAULT) {
    2. ESTIMATION DES FORCES D'ÉQUIPE
    ============================================================ */
 
-// Moyenne pondérée par la récence : un match récent pèse plus lourd.
 function weightedMean(values, weights) {
   const sw = weights.reduce((a, b) => a + b, 0);
   if (sw === 0) return { mean: 0, n: 0, weight: 0 };
@@ -133,15 +124,11 @@ function weightedMean(values, weights) {
   return { mean: s / sw, n: values.length, weight: sw };
 }
 
-// Shrinkage bayésien : ramène vers la moyenne de la compétition
-// proportionnellement à la quantité d'information disponible.
 function shrink(observed, prior, n) {
   const w = n / (n + SHRINK_K);
   return w * observed + (1 - w) * prior;
 }
 
-// Parcourt les matchs d'une équipe et renvoie ses taux de but
-// marqués / encaissés, pondérés par la récence.
 function teamRates(matches, teamName, now) {
   const rows = [];
 
@@ -163,8 +150,6 @@ function teamRates(matches, teamName, now) {
 
   const att = weightedMean(kept.map(r => r.gf), kept.map(r => r.w));
   const def = weightedMean(kept.map(r => r.ga), kept.map(r => r.w));
-  const homeShare = kept.filter(r => r.isHome).reduce((a, r) => a + r.w, 0) /
-                    (kept.reduce((a, r) => a + r.w, 0) || 1);
 
   return {
     n: kept.length,
@@ -172,29 +157,23 @@ function teamRates(matches, teamName, now) {
     ga: kept.reduce((a, r) => a + r.ga, 0),
     attRaw: att.mean,
     defRaw: def.mean,
-    attEff: att.weight,          // poids effectif = information disponible
-    defEff: def.weight,
-    homeShare
+    attEff: att.weight,
+    defEff: def.weight
   };
 }
 
-// Convertit les taux en espérances de buts (lambda).
 function lambdas(home, away) {
-  // Prior de la compétition, ajusté de l'avantage du terrain.
   const priorHome = LEAGUE_AVG.home;
   const priorAway = LEAGUE_AVG.away;
 
-  // Attaque de l'équipe x défense de l'adversaire, en ratio de la moyenne.
   const ratio = (att, def, prior) => (att / prior) * (def / prior);
 
   const xgHome = ratio(home.attRaw, away.defRaw, LEAGUE_AVG.total / 2) * priorHome;
   const xgAway = ratio(away.attRaw, home.defRaw, LEAGUE_AVG.total / 2) * priorAway;
 
-  // Information disponible = la plus faible des deux sources (attaque / défense).
-  const nHome = Math.min(home.attEff, away.defEff) / 1;   // poids exponentiel
-  const nAway = Math.min(away.attEff, home.defEff) / 1;
+  const nHome = Math.min(home.attEff, away.defEff);
+  const nAway = Math.min(away.attEff, home.defEff);
 
-  // Shrinkage vers le prior de la compétition.
   const lh = shrink(xgHome, priorHome, Math.min(nHome, FORM_DEPTH));
   const la = shrink(xgAway, priorAway, Math.min(nAway, FORM_DEPTH));
 
@@ -236,7 +215,6 @@ async function loadMatches() {
         </div>
       </div>`).join('');
 
-    // Écouteurs attachés proprement (pas de onclick inline avec des noms d'équipes).
     $('matches').querySelectorAll('button[data-id]').forEach(btn => {
       btn.onclick = () => chooseMatch(
         btn.dataset.id, btn.dataset.home, btn.dataset.away, btn.dataset.date
@@ -259,8 +237,7 @@ function chooseMatch(id, home, away, date) {
     `<div class="teams">${esc(home)} vs ${esc(away)}</div>
      <div class="small">${esc((date || '').replace('T', ' ').slice(0, 16))} UTC</div>`;
   $('probabilities').innerHTML = '<p class="muted">Récupération des derniers résultats…</p>';
-  $('marketSelect').innerHTML = '';
-  $('odds').value = '';
+  ['odd1', 'oddN', 'odd2'].forEach(f => { if ($(f)) $(f).value = ''; });
   $('analysisStatus').textContent = '';
 
   loadTeamStats();
@@ -293,8 +270,6 @@ async function loadTeamStats() {
     const { lh, la } = lambdas(home, away);
     state.model = { lh, la, rho: RHO_DEFAULT, home, away, fallback: false };
   } catch (e) {
-    // Fallback honnête : on l'annonce clairement, on ne fait pas passer
-    // une estimation générique pour une prédiction fondée sur les données.
     state.model = {
       lh: LEAGUE_AVG.home,
       la: LEAGUE_AVG.away,
@@ -333,19 +308,8 @@ function renderAnalysis() {
       <b>${(v * 100).toFixed(1)}%</b>
       <span>${esc(k)}</span>
       <div class="bar"><div style="width:${clamp(v * 100, 0, 100)}%"></div></div>
-      <button data-market="${esc(k)}">Choisir</button>
     </div>`).join('');
 
-  $('probabilities').querySelectorAll('button[data-market]').forEach(btn => {
-    btn.onclick = () => { $('marketSelect').value = btn.dataset.market; updateValueComparator(); };
-  });
-
-  $('marketSelect').innerHTML = Object.keys(probs).map(k =>
-    `<option value="${esc(k)}">${esc(k)} — ${(probs[k] * 100).toFixed(1)}%</option>`
-  ).join('');
-
-  // BUG V3 corrigé : le message d'erreur est affiché APRÈS le rendu,
-  // il n'est plus écrasé.
   if (m.fallback) {
     status('analysisStatus',
       'Estimation générique de secours : ' + esc(state.lastError || 'données insuffisantes') +
@@ -360,85 +324,122 @@ function renderAnalysis() {
 }
 
 /* ============================================================
-   4. COMPARATEUR DE COTES (marge retirée)
+   4. COMPARATEUR 1X2 — marge réellement retirée
+   ============================================================
+
+   La marge du bookmaker porte sur l'ensemble du marché, pas sur une
+   issue isolée. On la calcule donc sur les trois cotes ensemble, puis
+   on la répartit proportionnellement. Seule méthode défendable.
    ============================================================ */
 
-// Retire la marge du bookmaker par normalisation proportionnelle
-// sur les trois issues du marché 1X2. C'est le cœur du correctif :
-// sans ça, la proba implicite brute est gonflée et tout paraît "value".
-function fairProbabilities(odds1, oddsX, odds2) {
-  const raw = [1 / odds1, 1 / oddsX, 1 / odds2];
-  const overround = raw[0] + raw[1] + raw[2];
+function removeMargin(odds) {
+  const raw = odds.map(o => 1 / o);
+  const sum = raw.reduce((a, b) => a + b, 0);
   return {
-    fair: raw.map(p => p / overround),
-    overround
+    overround: sum - 1,
+    raw,
+    fair: raw.map(p => p / sum)
   };
 }
 
 function updateValueComparator() {
-  const odds = Number($('odds').value);
-  const market = $('marketSelect').value;
   const m = state.model;
+  const pick = state.picks.find(p => p.matchId === state.selected?.id) ? null : null;
 
-  const setAll = (values, msg, kind = '') => {
-    $('valueProbability').textContent = values[0];
-    $('valueFairOdds').textContent = values[1];
-    $('valueImpliedProbability').textContent = values[2];
-    $('valueTrueProbability').textContent = values[3];
-    $('valueGap').textContent = values[4];
-    status('valueVerdict', msg, kind);
+  const o1 = Number($('odd1')?.value);
+  const oN = Number($('oddN')?.value);
+  const o2 = Number($('odd2')?.value);
+  const allValid = [o1, oN, o2].every(o => Number.isFinite(o) && o > 1);
+
+  const setGaps = (v1, vN, v2) => {
+    $('gap1').textContent = v1;
+    $('gapN').textContent = vN;
+    $('gap2').textContent = v2;
   };
 
-  if (!state.selected || !m || !Number.isFinite(odds) || odds <= 1 || !market) {
-    setAll(['—', '—', '—', '—', '—'], 'Choisis un marché et saisis une cote supérieure à 1.');
+  if (!state.selected || !m || !allValid) {
+    $('valueFairOdds').textContent = '—';
+    $('valueOverround').textContent = '—';
+    setGaps('—', '—', '—');
+    $('marketTable').innerHTML = '';
+    status('valueVerdict', 'Saisis les trois cotes 1, N et 2 pour lancer la comparaison.');
     return;
   }
 
   const probs = calcProbs(m.lh, m.la, m.rho);
-  const p = probs[market];
+  const market = removeMargin([o1, oN, o2]);
 
-  if (!Number.isFinite(p) || p <= 0 || p > 1) {
-    setAll(['—', '—', '—', '—', '—'], 'Probabilité indisponible pour ce marché.', 'err');
+  if (market.overround <= 0) {
+    status('valueVerdict', 'Ces trois cotes sont incohérentes : la somme des probabilités implicites est inférieure à 1. Vérifie ta saisie.', 'err');
     return;
   }
 
-  const implied = 1 / odds;
-  const fairOdds = 1 / p;
+  const keys = ['1', 'N', '2'];
+  const modelArr = keys.map(k => probs[k]);
+  const edges = keys.map((k, i) => (modelArr[i] - market.fair[i]) * 100);
 
-  // Écart brut vs écart corrigé de la marge.
-  const gapRaw = (p - implied) * 100;
-  const gapTrue = (p - implied) * 100;   // sur ce marché isolé, la marge n'est pas isolable
+  // Cote théorique du modèle, affichée pour le 1 par défaut : on prend
+  // l'issue où le modèle est le plus confiant, c'est le repère le plus lisible.
+  const bestIdx = edges.indexOf(Math.max(...edges));
+  $('valueFairOdds').textContent = (1 / modelArr[bestIdx]).toFixed(2) + ' (' + keys[bestIdx] + ')';
+  $('valueOverround').textContent = (market.overround * 100).toFixed(1) + ' %';
 
-  // Sur un marché 1X2 complet, la marge est retirable. Sur les marchés
-  // dérivés (Over/Under, BTTS) on ne connaît pas l'autre côté, donc on
-  // affiche l'écart brut en le signalant comme tel.
-  const isMainMarket = ['1', 'N', '2'].includes(market);
+  const fmt = e => (e > 0 ? '+' : '') + e.toFixed(1) + ' pts';
+  setGaps(fmt(edges[0]), fmt(edges[1]), fmt(edges[2]));
 
-  let verdict;
-  let kind = '';
-  const absTrue = Math.abs(gapTrue);
+  $('marketTable').innerHTML = renderMarketTable(probs, market);
 
-  if (absTrue < 2) {
-    verdict = 'Écart négligeable : ta cote est proche de la probabilité estimée.';
-  } else if (gapTrue > 0) {
-    verdict = `Écart favorable de ${gapTrue.toFixed(1)} points : la cote proposée paie plus que ce que le modèle estime. À confronter au marché avant d'y croire.`;
+  // Verdict global : on retient l'issue où l'écart est le plus favorable.
+  const bestEdge = edges[bestIdx];
+  const labels = { '1': 'victoire domicile', 'N': 'match nul', '2': 'victoire extérieur' };
+  let verdict, kind = '';
+
+  if (bestEdge > 3) {
+    verdict = `Écart favorable de ${bestEdge.toFixed(1)} points sur « ${labels[keys[bestIdx]]} » (modèle ${(modelArr[bestIdx] * 100).toFixed(1)} % contre ${(market.fair[bestIdx] * 100).toFixed(1)} % de proba juste). Marge du book retirée : ${(market.overround * 100).toFixed(1)} %. À confronter à ta propre lecture du match avant d'y croire.`;
     kind = 'ok';
+  } else if (bestEdge > 0) {
+    verdict = `Léger avantage sur « ${labels[keys[bestIdx]]} » (+${bestEdge.toFixed(1)} pts). Trop faible pour compenser l'incertitude du modèle. Marge retirée : ${(market.overround * 100).toFixed(1)} %.`;
+    kind = 'warn';
   } else {
-    verdict = `Écart défavorable de ${absTrue.toFixed(1)} points : la cote paie moins que l'estimation du modèle.`;
+    verdict = `Aucune issue n'est favorable. Le bookmaker est plus confiant que le modèle sur les trois. Marge retirée : ${(market.overround * 100).toFixed(1)} %.`;
     kind = 'err';
   }
 
-  if (!isMainMarket) {
-    verdict += ' (Marché non 1X2 : la marge du bookmaker n\'est pas isolable ici, l\'écart affiché est brut.)';
-  }
+  status('valueVerdict', verdict, kind);
+}
 
-  setAll([
-    (p * 100).toFixed(1) + '%',
-    fairOdds.toFixed(2),
-    (implied * 100).toFixed(1) + '%',
-    (implied * 100).toFixed(1) + '%',
-    (gapTrue > 0 ? '+' : '') + gapTrue.toFixed(1) + ' pts'
-  ], verdict, kind);
+/* Rendu du tableau détaillé des trois issues. */
+function renderMarketTable(modelProbs, market) {
+  const labels = { '1': 'Victoire domicile', 'N': 'Match nul', '2': 'Victoire extérieur' };
+  const keys = ['1', 'N', '2'];
+
+  const rows = keys.map((k, i) => {
+    const modelP = modelProbs[k];
+    const fairP = market.fair[i];
+    const rawP = market.raw[i];
+    const edge = (modelP - fairP) * 100;
+
+    let cls = '';
+    if (edge > 2) cls = 'pos';
+    else if (edge < -2) cls = 'neg';
+
+    return `
+      <tr>
+        <td>${labels[k]}</td>
+        <td>${(modelP * 100).toFixed(1)} %</td>
+        <td>${(rawP * 100).toFixed(1)} %</td>
+        <td>${(fairP * 100).toFixed(1)} %</td>
+        <td class="${cls}">${edge > 0 ? '+' : ''}${edge.toFixed(1)} pts</td>
+      </tr>`;
+  }).join('');
+
+  return `
+    <table class="cmp">
+      <thead>
+        <tr><th>Issue</th><th>Modèle</th><th>Brut</th><th>Juste</th><th>Écart</th></tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 /* ============================================================
@@ -447,36 +448,45 @@ function updateValueComparator() {
 
 function addPick() {
   const m = state.model;
-  const market = $('marketSelect').value;
-  const odds = Number($('odds').value);
+  const o1 = Number($('odd1')?.value);
+  const oN = Number($('oddN')?.value);
+  const o2 = Number($('odd2')?.value);
 
   if (!state.selected || !m) {
     status('simStatus', 'Analyse un match avant d\'ajouter une sélection.', 'err');
     return;
   }
-  if (!Number.isFinite(odds) || odds <= 1) {
-    status('simStatus', 'Saisis une cote valide supérieure à 1.', 'err');
+  if (![o1, oN, o2].every(o => Number.isFinite(o) && o > 1)) {
+    status('simStatus', 'Saisis les trois cotes 1, N et 2 avant d\'ajouter une sélection.', 'err');
     return;
   }
-
-  // Une seule sélection par match : évite les combinés corrélés absurdes.
   if (state.picks.some(p => p.matchId === state.selected.id)) {
     status('simStatus', 'Ce match a déjà une sélection. Retire-la ou choisis un autre match.', 'err');
     return;
   }
 
   const probs = calcProbs(m.lh, m.la, m.rho);
+  const market = removeMargin([o1, oN, o2]);
+  const keys = ['1', 'N', '2'];
+
+  // On retient l'issue où l'écart modèle/marché est le plus favorable.
+  const edges = keys.map((k, i) => probs[k] - market.fair[i]);
+  const best = edges.indexOf(Math.max(...edges));
+  const bestKey = keys[best];
+
   state.picks.push({
     matchId: state.selected.id,
     match: state.selected.home + ' vs ' + state.selected.away,
-    market,
-    odds,
-    probability: probs[market]
+    market: bestKey,
+    odds: [o1, oN, o2][best],
+    probability: probs[bestKey]
   });
 
-  $('odds').value = '';
+  ['odd1', 'oddN', 'odd2'].forEach(f => { if ($(f)) $(f).value = ''; });
   renderCombo();
-  status('simStatus', 'Sélection ajoutée au combiné.', 'ok');
+  status('simStatus',
+    'Sélection ajoutée : « ' + bestKey + ' » sur ' + state.selected.home + ' vs ' + state.selected.away +
+    ' à la cote ' + [o1, oN, o2][best].toFixed(2) + '.', 'ok');
 }
 
 function renderCombo() {
@@ -569,7 +579,7 @@ function exportCsv() {
   ]);
   const csv = [header.join(','), ...rows.map(r => r.join(','))].join('\n');
 
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -588,8 +598,9 @@ function exportCsv() {
   ].join('-');
 
   $('loadMatches').onclick = loadMatches;
-  $('odds').oninput = updateValueComparator;
-  $('marketSelect').onchange = updateValueComparator;
+  if ($('odd1')) $('odd1').oninput = updateValueComparator;
+  if ($('oddN')) $('oddN').oninput = updateValueComparator;
+  if ($('odd2')) $('odd2').oninput = updateValueComparator;
   $('addPick').onclick = addPick;
   $('simulate').onclick = simulate;
   $('exportCsv').onclick = exportCsv;
