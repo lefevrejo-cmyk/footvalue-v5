@@ -59,26 +59,37 @@
 
   <hr class="sep">
 
-  <h3>Comparateur de cote</h3>
-  <p class="muted">La probabilité implicite du bookmaker inclut sa marge. FootValue la retire avant de comparer, sinon tout paraît favorable.</p>
-  <div class="row">
+  <h3>Comparateur de cote 1X2</h3>
+  <p class="muted">
+    Saisis les <b>trois cotes du marché 1X2</b> relevées chez Winamax. C'est la seule façon
+    de calculer la marge réelle du bookmaker et de la retirer avant de comparer.
+  </p>
+
+  <div class="row3">
     <div>
-      <label for="marketSelect">Marché</label>
-      <select id="marketSelect"></select>
+      <label for="odd1">Cote 1 (domicile)</label>
+      <input id="odd1" type="number" min="1.01" step="0.01" placeholder="Ex. 4.20" inputmode="decimal">
     </div>
     <div>
-      <label for="odds">Cote Winamax (décimale)</label>
-      <input id="odds" type="number" min="1.01" step="0.01" placeholder="Ex. 1.85">
+      <label for="oddN">Cote N (nul)</label>
+      <input id="oddN" type="number" min="1.01" step="0.01" placeholder="Ex. 3.60" inputmode="decimal">
+    </div>
+    <div>
+      <label for="odd2">Cote 2 (extérieur)</label>
+      <input id="odd2" type="number" min="1.01" step="0.01" placeholder="Ex. 1.75" inputmode="decimal">
     </div>
   </div>
+
   <div class="metrics">
-    <div class="metric"><span>Probabilité estimée</span><strong id="valueProbability">—</strong></div>
-    <div class="metric"><span>Cote théorique</span><strong id="valueFairOdds">—</strong></div>
-    <div class="metric"><span>Proba implicite brute</span><strong id="valueImpliedProbability">—</strong></div>
-    <div class="metric"><span>Proba juste (marge retirée)</span><strong id="valueTrueProbability">—</strong></div>
-    <div class="metric"><span>Écart vs marché</span><strong id="valueGap">—</strong></div>
+    <div class="metric"><span>Cote théorique modèle</span><strong id="valueFairOdds">—</strong></div>
+    <div class="metric"><span>Marge du bookmaker</span><strong id="valueOverround">—</strong></div>
+    <div class="metric"><span>Écart sur le 1</span><strong id="gap1">—</strong></div>
+    <div class="metric"><span>Écart sur le N</span><strong id="gapN">—</strong></div>
+    <div class="metric"><span>Écart sur le 2</span><strong id="gap2">—</strong></div>
   </div>
-  <div id="valueVerdict" class="status">Choisis un marché et saisis une cote supérieure à 1.</div>
+
+  <div id="marketTable"></div>
+  <div id="valueVerdict" class="status">Saisis les trois cotes 1, N et 2 pour lancer la comparaison.</div>
 
   <div class="actions">
     <button class="primary" id="addPick">Ajouter au combiné</button>
