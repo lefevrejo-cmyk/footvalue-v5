@@ -90,3 +90,23 @@ ul.foot li{margin-bottom:5px}
   .metrics{grid-template-columns:repeat(3,1fr)}
   .metrics.wide{grid-template-columns:repeat(5,1fr)}
 }
+
+/* ---------- Ajouts V5.1 : tableau comparateur 1X2 ---------- */
+table.cmp{
+  width:100%;border-collapse:collapse;margin-top:12px;font-size:13px;
+  background:#121b28;border-radius:11px;overflow:hidden;
+}
+table.cmp th,table.cmp td{
+  padding:9px 8px;text-align:right;border-bottom:1px solid var(--line);
+}
+table.cmp th{
+  color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;
+  letter-spacing:.04em;
+}
+table.cmp td:first-child,table.cmp th:first-child{text-align:left}
+table.cmp tr:last-child td{border-bottom:0}
+table.cmp td.pos{color:var(--accent);font-weight:700}
+table.cmp td.neg{color:var(--red);font-weight:700}
+
+/* Le comparateur occupe 3 colonnes en desktop */
+.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
