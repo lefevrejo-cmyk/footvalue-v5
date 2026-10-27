@@ -54,7 +54,7 @@
   <h2>3. Analyse du match</h2>
   <div id="selectedMatch"></div>
   <div class="metrics" id="statsMetrics"></div>
-  <p class="muted">Estimation Dixon-Coles sur la forme récente pondérée. Les probabilités sont expérimentales, pas des garanties.</p>
+  <p class="muted">Probabilités brutes du modèle Dixon-Coles : 40 derniers matchs de chaque équipe (saison précédente incluse si disponible), pondération exponentielle (demi-vie 90 jours), paramètres ramenés vers la moyenne de la compétition. Expérimental, pas des garanties.</p>
   <div class="marketgrid" id="probabilities"></div>
 
   <hr class="sep">
@@ -63,6 +63,8 @@
   <p class="muted">
     Saisis les <b>trois cotes du marché 1X2</b> relevées chez Winamax. C'est la seule façon
     de calculer la marge réelle du bookmaker et de la retirer avant de comparer.
+    La probabilité finale mélange 70 % de proba juste du marché et 30 % de modèle ;
+    les écarts sont calculés sur cette probabilité finale.
   </p>
 
   <div class="row3">
@@ -81,7 +83,7 @@
   </div>
 
   <div class="metrics">
-    <div class="metric"><span>Cote théorique modèle</span><strong id="valueFairOdds">—</strong></div>
+    <div class="metric"><span>Cote juste finale</span><strong id="valueFairOdds">—</strong></div>
     <div class="metric"><span>Marge du bookmaker</span><strong id="valueOverround">—</strong></div>
     <div class="metric"><span>Écart sur le 1</span><strong id="gap1">—</strong></div>
     <div class="metric"><span>Écart sur le N</span><strong id="gapN">—</strong></div>

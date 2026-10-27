@@ -107,6 +107,7 @@ table.cmp td:first-child,table.cmp th:first-child{text-align:left}
 table.cmp tr:last-child td{border-bottom:0}
 table.cmp td.pos{color:var(--accent);font-weight:700}
 table.cmp td.neg{color:var(--red);font-weight:700}
+table.cmp td.ind{color:var(--muted)}
 
 /* Le comparateur occupe 3 colonnes en desktop */
 .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}

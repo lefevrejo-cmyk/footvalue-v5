@@ -1,11 +1,14 @@
 /* ============================================================
-   FootValue V5.2 — moteur de calcul
+   FootValue V5.3 — moteur de calcul
    Dixon-Coles + pondération par récence + shrinkage bayésien.
-   Nouveautés V5.2 :
-     - LEAGUE_AVG calculé depuis l'historique réel de la compétition
-     - rho estimé par maximum de vraisemblance (par compétition)
-     - garde-fou : total de buts attendu vs moyenne de la compétition
-     - comparateur 1X2 avec marge retirée
+   Nouveautés V5.3 :
+     - 40 derniers matchs par équipe, saison précédente incluse si l'API
+       la fournit, pondération exponentielle (demi-vie ~90 jours)
+     - shrinkage des paramètres attaque/défense vers la moyenne de la
+       compétition : poids du prior = 10 / (10 + n)
+     - probabilité finale = 0,7 × marché (marge retirée) + 0,3 × modèle
+     - alerte « modèle incohérent » si le modèle contredit fortement le
+       marché sur l'issue favorite
    ============================================================ */
 
 const $ = id => document.getElementById(id);
@@ -23,13 +26,20 @@ const state = {
 /* ---------- Paramètres ajustables ---------- */
 
 // Décroissance exponentielle de la pondération par récence.
-const XI = 0.0025;              // demi-vie ~ 277 jours (~9 mois)
+const HALF_LIFE_DAYS = 90;
+const XI = Math.LN2 / HALF_LIFE_DAYS;   // ~0,0077 par jour
 
-// Force du shrinkage bayésien : n / (n + K).
-const SHRINK_K = 12;
+// Force du shrinkage bayésien : poids du prior = K / (K + n).
+const SHRINK_K = 10;
 
 // Matchs retenus par équipe pour l'estimation de forme.
-const FORM_DEPTH = 10;
+const FORM_DEPTH = 40;
+
+// Mélange avec le marché : p_finale = W · p_marché_juste + (1 − W) · p_modèle.
+const MARKET_WEIGHT = 0.7;
+
+// Seuil d'alerte : écart modèle − marché sur l'issue favorite (en points).
+const INCOHERENCE_PTS = -15;
 
 // Bornes de sécurité sur rho (le MLE peut partir très loin si l'échantillon
 // est petit ; on borne pour éviter une correction absurde).
@@ -246,59 +256,74 @@ function weightedMean(values, weights) {
   return { mean: s / sw, n: values.length, weight: sw };
 }
 
-function shrink(observed, prior, n) {
-  const w = n / (n + SHRINK_K);
-  return w * observed + (1 - w) * prior;
+// Ramène un indice (1 = moyenne de la compétition) vers 1.
+// Le poids du prior diminue quand le nombre de matchs augmente.
+function shrinkWeight(n) {
+  return SHRINK_K / (SHRINK_K + n);
 }
 
-function teamRates(matches, teamName, now) {
+function sameTeam(side, team) {
+  if (!side) return false;
+  if (team.id != null && side.id != null) return String(side.id) === String(team.id);
+  return side.name === team.name;
+}
+
+// Attaque et défense d'une équipe, exprimées en indice relatif à la
+// compétition : chaque but est rapporté à la moyenne attendue selon le
+// lieu (domicile / extérieur), puis pondéré par la récence.
+function teamRates(matches, team, now, leagueAvg) {
   const rows = [];
   for (const m of matches) {
-    const isHome = m.homeTeam?.name === teamName;
-    const isAway = m.awayTeam?.name === teamName;
+    const isHome = sameTeam(m.homeTeam, team);
+    const isAway = !isHome && sameTeam(m.awayTeam, team);
     if (!isHome && !isAway) continue;
-    const gf = isHome ? m.score.fullTime.home : m.score.fullTime.away;
-    const ga = isHome ? m.score.fullTime.away : m.score.fullTime.home;
-    const days = (now - new Date(m.utcDate)) / 86400000;
-    rows.push({ gf, ga, w: Math.exp(-XI * days) });
+    const t = new Date(m.utcDate).getTime();
+    if (!(t <= now)) continue;
+    rows.push({
+      t,
+      gf: isHome ? m.score.fullTime.home : m.score.fullTime.away,
+      ga: isHome ? m.score.fullTime.away : m.score.fullTime.home,
+      expGf: isHome ? leagueAvg.home : leagueAvg.away,
+      expGa: isHome ? leagueAvg.away : leagueAvg.home,
+      prev: !!m._prevSeason
+    });
   }
 
-  rows.sort((a, b) => b.w - a.w);
+  rows.sort((a, b) => b.t - a.t);
   const kept = rows.slice(0, FORM_DEPTH);
 
-  const att = weightedMean(kept.map(r => r.gf), kept.map(r => r.w));
-  const def = weightedMean(kept.map(r => r.ga), kept.map(r => r.w));
+  let sGf = 0, sGa = 0, sExpGf = 0, sExpGa = 0;
+  for (const r of kept) {
+    const w = Math.exp(-XI * (now - r.t) / 86400000);
+    sGf += w * r.gf; sExpGf += w * r.expGf;
+    sGa += w * r.ga; sExpGa += w * r.expGa;
+  }
+
+  const n = kept.length;
+  const attRaw = sExpGf > 0 ? sGf / sExpGf : 1;
+  const defRaw = sExpGa > 0 ? sGa / sExpGa : 1;
+  const priorW = shrinkWeight(n);
 
   return {
-    n: kept.length,
+    n,
+    nPrev: kept.filter(r => r.prev).length,
     gf: kept.reduce((a, r) => a + r.gf, 0),
     ga: kept.reduce((a, r) => a + r.ga, 0),
-    attRaw: att.mean,
-    defRaw: def.mean,
-    attEff: att.weight,
-    defEff: def.weight
+    attRaw,
+    defRaw,
+    priorW,
+    att: (1 - priorW) * attRaw + priorW,
+    def: (1 - priorW) * defRaw + priorW
   };
 }
 
+// Espérances de buts : attaque de l'un × défense de l'autre × moyenne
+// de la compétition pour le lieu. Le shrinkage est déjà appliqué aux
+// indices d'équipe, on ne le réapplique pas ici.
 function lambdas(home, away, leagueAvg) {
-  const priorHome = leagueAvg.home;
-  const priorAway = leagueAvg.away;
-  const grand = (priorHome + priorAway) / 2 || 1.36;
-
-  const ratio = (att, def, prior) => (att / prior) * (def / prior);
-
-  const xgHome = ratio(home.attRaw, away.defRaw, grand) * priorHome;
-  const xgAway = ratio(away.attRaw, home.defRaw, grand) * priorAway;
-
-  const nHome = Math.min(home.attEff, away.defEff);
-  const nAway = Math.min(away.attEff, home.defEff);
-
-  const lh = shrink(xgHome, priorHome, Math.min(nHome, FORM_DEPTH));
-  const la = shrink(xgAway, priorAway, Math.min(nAway, FORM_DEPTH));
-
   return {
-    lh: clamp(lh, 0.25, 3.8),
-    la: clamp(la, 0.20, 3.4)
+    lh: clamp(home.att * away.def * leagueAvg.home, 0.25, 3.8),
+    la: clamp(away.att * home.def * leagueAvg.away, 0.20, 3.4)
   };
 }
 
@@ -330,12 +355,13 @@ async function loadMatches() {
         </div>
         <div class="small">${esc((m.utcDate || '').replace('T', ' ').slice(0, 16))} UTC · ${esc(m.status || '')}</div>
         <div class="actions">
-          <button class="secondary" data-home="${esc(m.homeTeam.name)}" data-away="${esc(m.awayTeam.name)}" data-date="${esc(m.utcDate || '')}" data-id="${m.id}">Analyser ce match</button>
+          <button class="secondary" data-home="${esc(m.homeTeam.name)}" data-away="${esc(m.awayTeam.name)}" data-home-id="${esc(m.homeTeam.id ?? '')}" data-away-id="${esc(m.awayTeam.id ?? '')}" data-date="${esc(m.utcDate || '')}" data-id="${m.id}">Analyser ce match</button>
         </div>
       </div>`).join('');
 
     $('matches').querySelectorAll('button[data-id]').forEach(btn => {
-      btn.onclick = () => chooseMatch(btn.dataset.id, btn.dataset.home, btn.dataset.away, btn.dataset.date);
+      btn.onclick = () => chooseMatch(btn.dataset.id, btn.dataset.home, btn.dataset.away, btn.dataset.date,
+        btn.dataset.homeId, btn.dataset.awayId);
     });
 
     status('apiStatus', matches.length + ' match(s) récupéré(s).', 'ok');
@@ -345,8 +371,8 @@ async function loadMatches() {
   }
 }
 
-function chooseMatch(id, home, away, date) {
-  state.selected = { id, home, away, date };
+function chooseMatch(id, home, away, date, homeId, awayId) {
+  state.selected = { id, home, away, date, homeId: homeId || null, awayId: awayId || null };
   state.lastError = null;
 
   $('analysis').classList.remove('hidden');
@@ -364,17 +390,42 @@ function chooseMatch(id, home, away, date) {
 // si l'utilisateur enchaîne plusieurs matchs de la même compétition.
 const historyCache = new Map();
 
+const isFinished = m =>
+  m.status === 'FINISHED' &&
+  m.score?.fullTime?.home != null &&
+  m.score?.fullTime?.away != null;
+
+// Saison en cours + saison précédente si l'abonnement API la couvre.
+// En cas de refus (forfait gratuit, 403…), on continue avec la saison en cours.
 async function getFinishedMatches(comp) {
   if (historyCache.has(comp)) return historyCache.get(comp);
 
   const d = await api(`competitions/${comp}/matches?status=FINISHED`);
-  const all = (d.matches || []).filter(m =>
-    m.status === 'FINISHED' &&
-    m.score?.fullTime?.home != null &&
-    m.score?.fullTime?.away != null
+  const current = (d.matches || []).filter(isFinished);
+
+  const startYear = Number(
+    d.filters?.season ??
+    (d.matches || []).find(m => m.season?.startDate)?.season.startDate.slice(0, 4)
   );
-  historyCache.set(comp, all);
-  return all;
+
+  let previous = [];
+  let prevAvailable = false;
+  if (Number.isFinite(startYear) && startYear > 1900) {
+    try {
+      const p = await api(`competitions/${comp}/matches?season=${startYear - 1}&status=FINISHED`);
+      const seen = new Set(current.map(m => m.id));
+      previous = (p.matches || [])
+        .filter(m => isFinished(m) && !seen.has(m.id))
+        .map(m => ({ ...m, _prevSeason: true }));
+      prevAvailable = previous.length > 0;
+    } catch {
+      // Saison précédente non accessible : on garde la saison en cours seule.
+    }
+  }
+
+  const result = { matches: current.concat(previous), prevAvailable, nPrev: previous.length };
+  historyCache.set(comp, result);
+  return result;
 }
 
 async function loadTeamStats() {
@@ -382,7 +433,8 @@ async function loadTeamStats() {
 
   try {
     const comp = $('competition').value;
-    const all = await getFinishedMatches(comp);
+    const hist = await getFinishedMatches(comp);
+    const all = hist.matches;
 
     if (all.length < 20) {
       throw new Error('Seulement ' + all.length + ' match(s) terminé(s) dans cette compétition : échantillon trop court pour calibrer le modèle.');
@@ -400,13 +452,16 @@ async function loadTeamStats() {
         rho: rhoEst.rho,
         rhoCalibrated: rhoEst.calibrated,
         rhoN: rhoEst.n,
-        nbMatchs: all.length
+        nbMatchs: all.length,
+        prevAvailable: hist.prevAvailable,
+        nbMatchsPrev: hist.nPrev
       };
     }
     const cohort = state.cohort;
 
-    const home = teamRates(all, state.selected.home, now);
-    const away = teamRates(all, state.selected.away, now);
+    const sel = state.selected;
+    const home = teamRates(all, { id: sel.homeId, name: sel.home }, now, cohort.leagueAvg);
+    const away = teamRates(all, { id: sel.awayId, name: sel.away }, now, cohort.leagueAvg);
 
     if (home.n === 0 || away.n === 0) {
       throw new Error('Aucun match récent retrouvé pour l\'une des deux équipes (noms non concordants ou historique insuffisant).');
@@ -425,8 +480,8 @@ async function loadTeamStats() {
       lh: FALLBACK_AVG.home,
       la: FALLBACK_AVG.away,
       rho: FALLBACK_RHO,
-      home: { n: 0, gf: 0, ga: 0 },
-      away: { n: 0, gf: 0, ga: 0 },
+      home: { n: 0, nPrev: 0, gf: 0, ga: 0 },
+      away: { n: 0, nPrev: 0, gf: 0, ga: 0 },
       cohort: null,
       fallback: true
     };
@@ -440,11 +495,13 @@ function renderAnalysis() {
   const m = state.model;
   if (!m) return;
 
+  const sel = state.selected || {};
+  const nbLabel = t => t.n + (t.nPrev ? ` (dont ${t.nPrev} saison préc.)` : '');
   const metrics = [
-    ['Matchs retenus dom.', m.home.n],
+    ['Matchs utilisés · ' + (sel.home || 'dom.'), nbLabel(m.home)],
     ['Buts marqués dom.', m.home.gf],
     ['Buts encaissés dom.', m.home.ga],
-    ['Matchs retenus ext.', m.away.n],
+    ['Matchs utilisés · ' + (sel.away || 'ext.'), nbLabel(m.away)],
     ['Buts marqués ext.', m.away.gf],
     ['Buts encaissés ext.', m.away.ga]
   ];
@@ -481,14 +538,19 @@ function renderAnalysis() {
       'Estimation générique de secours : ' + (state.lastError || 'données insuffisantes') +
       ' Ce n\'est pas une prédiction fondée sur les données du match.', 'warn');
   } else {
+    const prevMsg = m.cohort?.prevAvailable
+      ? `dont ${m.cohort.nbMatchsPrev} de la saison précédente`
+      : 'saison précédente non disponible via l\'API';
+    const shrinkMsg = `poids de la moyenne de la compétition : ${(m.home.priorW * 100).toFixed(0)} % (dom.) / ${(m.away.priorW * 100).toFixed(0)} % (ext.)`;
     const calib = m.cohort?.rhoCalibrated
       ? `rho estimé sur ${m.cohort.rhoN} scores faibles (${m.cohort.nbMatchs} matchs de la compétition)`
       : `rho de repli (${FALLBACK_RHO}) : historique trop court pour l'estimer`;
 
     status('analysisStatus',
       `Espérances : ${m.lh.toFixed(2)} (dom.) / ${m.la.toFixed(2)} (ext.). ` +
-      `Forme sur ${m.home.n} et ${m.away.n} matchs pondérés. ` +
-      `Moyenne de la compétition calculée sur ${m.cohort?.nbMatchs ?? 0} matchs, ${calib}. ` +
+      `Matchs utilisés : ${m.home.n} pour ${sel.home} et ${m.away.n} pour ${sel.away} ` +
+      `(pondération exponentielle, demi-vie ${HALF_LIFE_DAYS} jours ; ${shrinkMsg}). ` +
+      `Moyenne de la compétition calculée sur ${m.cohort?.nbMatchs ?? 0} matchs (${prevMsg}), ${calib}. ` +
       coherenceMsg,
       incoherent ? 'warn' : '');
   }
@@ -506,29 +568,46 @@ function removeMargin(odds) {
   return { overround: sum - 1, raw, fair: raw.map(p => p / sum) };
 }
 
-function renderMarketTable(modelProbs, market) {
-  const labels = { '1': 'Victoire domicile', 'N': 'Match nul', '2': 'Victoire extérieur' };
+// Probabilité finale = W · marché juste + (1 − W) · modèle.
+// Les écarts sont calculés sur cette probabilité finale ; l'écart brut
+// du modèle sert uniquement au contrôle de cohérence.
+function blendWithMarket(probs, market) {
   const keys = ['1', 'N', '2'];
+  const model = keys.map(k => probs[k]);
+  const final = model.map((p, i) => MARKET_WEIGHT * market.fair[i] + (1 - MARKET_WEIGHT) * p);
+  const edges = final.map((p, i) => (p - market.fair[i]) * 100);
+  const modelEdges = model.map((p, i) => (p - market.fair[i]) * 100);
 
-  const rows = keys.map((k, i) => {
-    const modelP = modelProbs[k], fairP = market.fair[i], rawP = market.raw[i];
-    const edge = (modelP - fairP) * 100;
+  // Issue favorite = cote la plus basse = proba implicite la plus haute.
+  const favIdx = market.raw.indexOf(Math.max(...market.raw));
+  const incoherent = modelEdges[favIdx] < INCOHERENCE_PTS;
+
+  return { keys, model, final, edges, modelEdges, favIdx, incoherent };
+}
+
+function renderMarketTable(blend, market) {
+  const labels = { '1': 'Victoire domicile', 'N': 'Match nul', '2': 'Victoire extérieur' };
+
+  const rows = blend.keys.map((k, i) => {
+    const edge = blend.edges[i];
     let cls = '';
-    if (edge > 2) cls = 'pos';
+    if (!blend.incoherent && edge > 2) cls = 'pos';
     else if (edge < -2) cls = 'neg';
     return `<tr>
-        <td>${labels[k]}</td>
-        <td>${(modelP * 100).toFixed(1)} %</td>
-        <td>${(rawP * 100).toFixed(1)} %</td>
-        <td>${(fairP * 100).toFixed(1)} %</td>
+        <td>${labels[k]}${i === blend.favIdx ? ' ★' : ''}</td>
+        <td class="ind">${(blend.model[i] * 100).toFixed(1)} %</td>
+        <td>${(market.raw[i] * 100).toFixed(1)} %</td>
+        <td>${(market.fair[i] * 100).toFixed(1)} %</td>
+        <td><b>${(blend.final[i] * 100).toFixed(1)} %</b></td>
         <td class="${cls}">${edge > 0 ? '+' : ''}${edge.toFixed(1)} pts</td>
       </tr>`;
   }).join('');
 
   return `<table class="cmp">
-      <thead><tr><th>Issue</th><th>Modèle</th><th>Brut</th><th>Juste</th><th>Écart</th></tr></thead>
+      <thead><tr><th>Issue</th><th>Modèle brut</th><th>Brut</th><th>Juste</th><th>Finale</th><th>Écart</th></tr></thead>
       <tbody>${rows}</tbody>
-    </table>`;
+    </table>
+    <p class="foot">Finale = ${Math.round(MARKET_WEIGHT * 100)} % proba juste du marché + ${Math.round((1 - MARKET_WEIGHT) * 100)} % modèle. Écart = finale − juste. « Modèle brut » est donné à titre indicatif. ★ = issue favorite (cote la plus basse).</p>`;
 }
 
 function updateValueComparator() {
@@ -564,39 +643,45 @@ function updateValueComparator() {
   // qui ne sont pas comparables à une estimation d'avant-match.
   const margeElevee = market.overround > 0.12;
 
-  const keys = ['1', 'N', '2'];
-  const modelArr = keys.map(k => probs[k]);
-  const edges = keys.map((k, i) => (modelArr[i] - market.fair[i]) * 100);
+  const blend = blendWithMarket(probs, market);
+  const { keys, final, edges } = blend;
 
   const bestIdx = edges.indexOf(Math.max(...edges));
-  $('valueFairOdds').textContent = (1 / modelArr[bestIdx]).toFixed(2) + ' (' + keys[bestIdx] + ')';
+  $('valueFairOdds').textContent = (1 / final[bestIdx]).toFixed(2) + ' (' + keys[bestIdx] + ')';
   $('valueOverround').textContent = (market.overround * 100).toFixed(1) + ' %';
 
   const fmt = e => (e > 0 ? '+' : '') + e.toFixed(1) + ' pts';
   setGaps(fmt(edges[0]), fmt(edges[1]), fmt(edges[2]));
 
-  $('marketTable').innerHTML = renderMarketTable(probs, market);
+  $('marketTable').innerHTML = renderMarketTable(blend, market);
 
   const bestEdge = edges[bestIdx];
   const labels = { '1': 'victoire domicile', 'N': 'match nul', '2': 'victoire extérieur' };
+  const margeTxt = `Marge retirée : ${(market.overround * 100).toFixed(1)} %.`;
   let verdict, kind = '';
 
-  if (margeElevee) {
+  if (blend.incoherent) {
+    verdict = `Modèle incohérent sur ce match, écarts non fiables. ` +
+      `Sur l'issue favorite (« ${labels[keys[blend.favIdx]]} »), le modèle brut est à ` +
+      `${blend.modelEdges[blend.favIdx].toFixed(1)} points de la proba juste du marché.` +
+      (margeElevee ? ` Marge de ${(market.overround * 100).toFixed(1)} % : cotes probablement en direct.` : '');
+    kind = 'warn';
+  } else if (margeElevee) {
     verdict = `Marge de ${(market.overround * 100).toFixed(1)} % : ces cotes ressemblent à du jeu en direct. ` +
       `Un modèle d'avant-match n'est pas comparable à des cotes live — le score et la minute changent tout.`;
     kind = 'warn';
   } else if (bestEdge > 3) {
     verdict = `Écart favorable de ${bestEdge.toFixed(1)} points sur « ${labels[keys[bestIdx]]} » ` +
-      `(modèle ${(modelArr[bestIdx] * 100).toFixed(1)} % contre ${(market.fair[bestIdx] * 100).toFixed(1)} % de proba juste). ` +
-      `Marge retirée : ${(market.overround * 100).toFixed(1)} %. À confronter à ta propre lecture du match avant d'y croire.`;
+      `(proba finale ${(final[bestIdx] * 100).toFixed(1)} % contre ${(market.fair[bestIdx] * 100).toFixed(1)} % de proba juste ; ` +
+      `modèle brut ${(blend.model[bestIdx] * 100).toFixed(1)} %). ` +
+      `${margeTxt} À confronter à ta propre lecture du match avant d'y croire.`;
     kind = 'ok';
   } else if (bestEdge > 0) {
-    verdict = `Léger avantage sur « ${labels[keys[bestIdx]]} » (+${bestEdge.toFixed(1)} pts). ` +
-      `Trop faible pour compenser l'incertitude du modèle. Marge retirée : ${(market.overround * 100).toFixed(1)} %.`;
+    verdict = `Léger avantage sur « ${labels[keys[bestIdx]]} » (+${bestEdge.toFixed(1)} pts sur la proba finale). ` +
+      `Trop faible pour compenser l'incertitude du modèle. ${margeTxt}`;
     kind = 'warn';
   } else {
-    verdict = `Aucune issue n'est favorable. Le bookmaker est plus confiant que le modèle sur les trois. ` +
-      `Marge retirée : ${(market.overround * 100).toFixed(1)} %.`;
+    verdict = `Aucune issue n'est favorable. Le bookmaker est plus confiant que le modèle sur les trois. ${margeTxt}`;
     kind = 'err';
   }
 
@@ -628,8 +713,7 @@ function addPick() {
 
   const probs = calcProbs(m.lh, m.la, m.rho);
   const market = removeMargin([o1, oN, o2]);
-  const keys = ['1', 'N', '2'];
-  const edges = keys.map((k, i) => probs[k] - market.fair[i]);
+  const { keys, final, edges } = blendWithMarket(probs, market);
   const best = edges.indexOf(Math.max(...edges));
   const bestKey = keys[best];
   const oddsArr = [o1, oN, o2];
@@ -639,7 +723,7 @@ function addPick() {
     match: state.selected.home + ' vs ' + state.selected.away,
     market: bestKey,
     odds: oddsArr[best],
-    probability: probs[bestKey]
+    probability: final[best]
   });
 
   ['odd1', 'oddN', 'odd2'].forEach(f => { if ($(f)) $(f).value = ''; });
